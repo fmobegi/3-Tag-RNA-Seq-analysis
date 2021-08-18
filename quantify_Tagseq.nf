@@ -193,38 +193,64 @@ process align_reads {
     set val(sampleID), file("${sampleID}.tt.fq") from readsForAligner
 
     output:
-    set val(sampleID), file("${sampleID}.bwa.bam")  into bamForCounting
+    set val(sampleID), file("${sampleID}.bam") into bamForStringtie
 
     script:
-    //##gmapper --qv-offset 33 -Q --strata -o 3 -N 1 "${sampleID}.tt.fq" ${params.reference} > '${sampleID}.bwa.bam'
-    """#docker run --user $(id -u):$(id -g) -v $(pwd):/work_dir fmobegi/tagseq_utils:1.0.0-beta \
-    bwa mem -t 8 '${params.reference}' '${sampleID}.tt.fq' | samtools sort -@8 -o '${sampleID}.bwa.bam' -
-    samtools index '${sampleID}.bwa.bam'
+    """
+    bwa mem -t 8 '${params.reference}' fqreads.af.fq.gz | \
+    samtools sort -@8 -o '${sampleID}.bam' -
+    #samtools index '${sampleID}.bam'
     """
 }
 
-process count_alignments {
+
+//Stringtie
+process stringtie_count {
     tag "${sampleID}"
-    publishDir "${params.outdir}", mode: 'copy', pattern: '*.tsv'
+    publishDir "${params.outdir}", mode: 'copy', pattern: '*'
 
     input:
-    set val(sampleID), file("${sampleID}.bwa.bam") from bamForCounting
+    set val(sampleID), file("${sampleID}.bam") from bamForStringtie
 
     output:
-    file "${sampleID}.ht_seq.tsv" into combineCounts
-    // After the test run.. BWA->HTseqCount had the most consistent results
+    set val(sampleID), file("${sampleID}.Hisat2.ga"), file("${sampleID}.Hisat2.gtf") into gtfForCounts
 
     script:
-    //##SAMFilterByGene.pl -i "${sampleID}.bwa.bam" -m 40 -o "${sampleID}.filtered.sam"
     """
-    #docker run --user $(id -u):$(id -g) -v $(pwd):/work_dir fmobegi/tagseq_utils:1.0.0-beta \
-    htseq-count --format=bam \
-        --stranded=no \
-        --type=CDS \
-        --order=pos \
-        --idattr=Name \
-        "${sampleID}.bwa.bam" '${params.gff3}' \
-        > "${sampleID}.ht_seq.tsv"
+    stringtie \
+        -e \
+        -v \
+        -p ${params.cores} \
+        -e \
+        -o ${sampleID}.Hisat2.gtf \
+        -G ${params.gff3} \
+        -A ${sampleID}.Hisat2.ga \
+        -l ${sampleID} \
+        '${sampleID}.bam'
+    """
+}
+
+process counts_tab {
+    tag "${sampleID}"
+    label "stringtie"
+
+    publishDir "${params.outdir}", mode: 'copy', pattern: '*'
+
+    input:
+    set val(sampleID), file("${sampleID}.Hisat2.ga"), file("${sampleID}.Hisat2.gtf") from gtfForCounts
+
+    output:
+    set val(sampleID), file("${sampleID}.Hisat2.fpkm"), file("${sampleID}.Hisat2.tpm"),file("${sampleID}.Hisat2.raw") into combineCounts
+    file "*.raw.pre"
+
+    script:
+    """
+    awk -F"\\t" '{if (NR!=1) {print \$1, \$8}}' OFS='\\t' ${sampleID}.Hisat2.ga > ${sampleID}.Hisat2.fpkm
+    awk -F"\\t" '{if (NR!=1) {print \$1, \$9}}' OFS='\\t' ${sampleID}.Hisat2.ga > ${sampleID}.Hisat2.tpm
+    echo -e "${sampleID}\\t./${sampleID}.Hisat2.gtf" > ${sampleID}.gtf_files
+    prepDE.py -i ${sampleID}.gtf_files -g ${sampleID}.raw.pre
+    grep -v "gene_id" "${sampleID}.raw.pre" | sed 's/,/\t/g' > ${sampleID}.Hisat2.raw
+    
     """
 }
 
@@ -235,7 +261,7 @@ combineCounts.collect().set{all_counts_tab}
 Waiting for all samples to be processed before combining them into  single count matrix!
 """ */
  
-process combine_counts{
+/* process combine_counts{
     tag "${sampleID}"
     publishDir "${params.outdir}", mode: 'copy'
 
@@ -247,8 +273,13 @@ process combine_counts{
 
     script:
     """
-    CombineExpression.pl all_counts_tab > abundance.matrix.tsv
+    // Do this process manually inside the output directory 
+
+    /* create-gem.py --sources . --prefix Ecoracana_560_v1.countmatrix --type raw
+    create-gem.py --sources . --prefix Ecoracana_560_v1.countmatrix --type FPKM
+    create-gem.py --sources . --prefix Ecoracana_560_v1.countmatrix --type TPM
+
     """
-}
+} */
 
 
