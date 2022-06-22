@@ -261,10 +261,9 @@ combineCounts.collect().set{all_counts_tab}
 Waiting for all samples to be processed before combining them into  single count matrix!
 """ */
  
-/* process combine_counts{
+process combine_counts{
     tag "${sampleID}"
     publishDir "${params.outdir}", mode: 'copy'
-
     input:
     all_counts_tab
 
@@ -272,14 +271,12 @@ Waiting for all samples to be processed before combining them into  single count
     file 'abundance.matrix.tsv'
 
     script:
-    """
     // Do this process manually inside the output directory 
-
-    /* create-gem.py --sources . --prefix Ecoracana_560_v1.countmatrix --type raw
+    """
+    create-gem.py --sources . --prefix Ecoracana_560_v1.countmatrix --type raw
     create-gem.py --sources . --prefix Ecoracana_560_v1.countmatrix --type FPKM
     create-gem.py --sources . --prefix Ecoracana_560_v1.countmatrix --type TPM
 
     """
-} */
-
+} 
 
