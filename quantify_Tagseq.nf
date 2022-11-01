@@ -1,5 +1,5 @@
 #!/usr/bin/env nextflow
-
+export NXF_DEFAULT_DSL=1
 /*
 vim: syntax=groovy
 -*- mode: groovy;-*-
@@ -250,7 +250,6 @@ process counts_tab {
     echo -e "${sampleID}\\t./${sampleID}.Hisat2.gtf" > ${sampleID}.gtf_files
     prepDE.py -i ${sampleID}.gtf_files -g ${sampleID}.raw.pre
     grep -v "gene_id" "${sampleID}.raw.pre" | sed 's/,/\t/g' > ${sampleID}.Hisat2.raw
-    
     """
 }
 
@@ -276,7 +275,6 @@ process combine_counts{
     create-gem.py --sources . --prefix Ecoracana_560_v1.countmatrix --type raw
     create-gem.py --sources . --prefix Ecoracana_560_v1.countmatrix --type FPKM
     create-gem.py --sources . --prefix Ecoracana_560_v1.countmatrix --type TPM
-
     """
 } 
 
