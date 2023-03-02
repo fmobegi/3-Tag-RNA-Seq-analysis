@@ -111,7 +111,6 @@ process fastq_quality_filter {
 
 
 //Homopolymer repeat filter
-
 process fastq_homopolymer_repeat_filter {
     tag "${sampleID}"
     publishDir "${params.outdir}", mode: 'copy', pattern: '*.fq'
@@ -149,7 +148,6 @@ process fastq_adaptor_filter {
     }
 
 //Remove PCR Duplicates process is optional.. 
-
 process fastq_PCR_dereplication {
     tag "${sampleID}"
     publishDir "${params.outdir}", mode: 'copy', pattern: '*.fq'
@@ -203,7 +201,6 @@ process align_reads {
         #samtools index '${sampleID}.bam'
         """
     }
-
 
 //Stringtie
 process stringtie_count {
