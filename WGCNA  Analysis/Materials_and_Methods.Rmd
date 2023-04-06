@@ -1,0 +1,334 @@
+---
+title: "Quality trimming, read alignment and transcript counting in 3′ Tag-RNA-Seq data"
+editor_options:
+  chunk_output_type: console
+output:
+  html_document: 
+    fig_caption: yes
+    number_sections: yes
+    toc: yes
+  pdf_document:
+    toc: yes
+always_allow_html: yes
+---
+<style type="text/css">
+
+body{/* Normal */
+  font-size: 18px;
+  font-family: "Corbel";
+  }
+  
+td{/* Table */
+  font-size: 14px;
+  font-family: "Corbel";
+  }
+
+h1.title{
+  font-size: 38px;
+  font-family: "Corbel";
+  color: DarkRed;
+  }
+
+h1{/* Header 1 */
+  font-size: 28px;
+  font-family: "Corbel";
+  color: DarkBlue;
+  }
+  
+h2{/* Header 2 */
+  font-size: 22px;
+  font-family: "Corbel";
+  color: DarkBlue;
+  }
+  
+h3{/* Header 3 */
+  font-size: 18px;
+  font-family: "Book Antigua";
+  color: DarkBlue;
+  }
+code.r{/* Code block */
+    font-size: 13px;
+    font-family: "Book Antigua";
+  }
+pre{/* Code block - determines code spacing between lines */
+    font-size: 13px;
+    font-family: "Book Antigua";
+  }
+  
+pre code.bash {
+  background: #B53389;
+  font-size: 13px;
+  font-family: "Book Antigua";
+  }
+  
+</style>
+
+```{r setup, include=FALSE, error=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+# The tools
+
+TagSeq utilities (`https://github.com/Eli-Meyer/TagSeq_utilities`) were used for this analysis.
+The scripts were installed in the local machine following the author's instruction.
+
+If you have docker installed, I have created a docker image containing all the required software to analyse TagSeq data.
+To run it just do:
+
+```{r, engine='bash', eval=FALSE}
+docker pull fmobegi/tagseq_utils:1.0.0-beta
+docker run \
+    --user $(id -u):$(id -g) \
+    -v $(pwd):/work_dir \
+    fmobegi/tagseq_utils:1.0.0-beta \
+    SCRIPT_TO_RUN \
+    [options]
+  
+```
+
+_**For example:**_
+
+```{r, engine='bash', eval=FALSE}
+docker run \
+    --user $(id -u):$(id -g) \
+    -v $(pwd):/work_dir \
+    fmobegi/tagseq_utils:1.0.0-beta \
+    SAMFilterByGene.pl \
+    -i sample.sam \
+    -o sample.filtered.sam
+
+```
+
+Running each script with *`--help`* provides the full array of input parameters.
+
+_**TRY:**_
+
+```{r, engine='bash', eval=FALSE}
+docker run \
+    --user $(id -u):$(id -g) \
+    -v $(pwd):/work_dir \
+    fmobegi/tagseq_utils:1.0.0-beta \
+    SAMFilterByGene.pl --help
+    
+```
+
+ 
+NB: If you do not have sudo privileges on the system where you're running the scripts from, try pulling the image as a singularity container and run normally without root rights
+
+To run the scripts, first prepare the input `fastq`. 
+
+The scripts provided cannot process gzipped files.
+
+01. First, copy files to working directory (`cp SA*/*.gz /data/RNAseqDir/` && `cd /data/RNAseqDir/`), rename samples (`rename 's/_R1_001//g' *.gz`) and, unzip them (`parallel --gnu gunzip  ::: *gz`)
+
+02. Index the reference genome `bwa, star, hisat2` all need indexes. refer to specific tools for instruction.
+
+03. Extract GF3 annotations for __Brachiaria (GCA_002174835.2_ASM217483v2_genomic.gbff)__ and __Cenchrus_americanus (GCA_003016355.1_Bruz_genomic.gbff)__: 
+
+```
+bp_genbank2gff3 --GFF_VERSION 3 *.gbff
+
+##from 
+
+sudo apt update && sudo apt-get install -y bioperl
+
+```
+
+# Preprocessing and quality control of raw 3′ Tag-RNA-Seq reads
+## Quality filtering and removal of adapters.
+First, reads were filtered based on quality score __Q $\geq$ 20__ and __LQ $\leq$ 10__.
+Reads that passed this step were then depleted of homo-polymer repeats and adapter sequences.
+
+## Alignment to the reference genomes
+After removing PCR duplicates and trimming the TAGS, reads were mapped to various reference genomes using __`STAR`v.2.7.3a__, __`BBMap`v.38.92__, and __`BWA`v.0.7.17-r1188__. 
+The alignments in `BAM` format were sorted and indexed using __`SAMtools`v.1.10__ running __`htslib`v.1.10.2-3__. 
+Transcripts were counted using __`HTSeq-count`v.0.11.2__ and __`StringTie`v.2.1.1__.
+
+The quality of reads was assessed before and after QC using `FastQC`v.0.11.9 and reports compiled using __`MultiQC`v.1.11__.
+
+NB: Removal of PCR duplicates led to massive loss in reads from ~3M-4M, to 0.5M-1.25M reads. 
+This in turn affected the final transcripts count. We opted to skip this **<a href="http://eli-meyer.github.io/TagSeq_utilities/index.html#process" target="_blank">optional</a>** step while re-analyzing the data. **<a href="https://dnatech.genomecenter.ucdavis.edu/tag-seq-gene-expression-profiling/" tagte="_blank">Trimming is also not necessary when using local aligners</a>**.
+
+# The workflow
+These steps have been stitched together in a dummy `Nexflow` workflow **<a href="https://github.com/fmobegi/3-Tag-RNA-Seq-analysis/blob/main/quantify_Tagseq.nf" target="_blank">here</a>**.
+
+The script can be executed like:
+
+```{r, engine='bash', eval=FALSE}
+nextflow run -resume quantify_Tagseq.nf \
+	--transcriptome "*.fastq" \
+	--cores 14 \
+	--adaptors 'adaptors.fa' \
+	--outdir 'results_TagSeq'
+```
+
+# Assembly parameters used for different aligners and transcript counters
+
+```{r, engine='bash', eval=FALSE}
+
+## Aligners 
+#...............................................
+
+bwa mem \
+    -t 8 \
+    '${params.reference}' fqreads.af.fq.gz | \
+    samtools sort \
+        -@8 \
+        -o '${sampleID}.bam' -
+
+
+samtools index \
+    '${sampleID}'.bam \
+    '${sampleID}'.bam.bai
+
+    
+STAR \
+    --runThreadN 14 \
+    --runMode genomeGenerate \
+    --genomeDir '${sampleID}' \
+    --genomeFastaFiles '${params.reference}' \
+    --sjdbGTFfile '${params.gtf}' \
+    --sjdbOverhang 99
+
+
+STAR \
+    --runThreadN 14
+    --genomeDir '${params.reference}' \
+    --readFilesIn '${sampleID}'.tt.fq.gz \
+    --readFilesCommand zcat \
+    --outSAMtype BAM SortedByCoordinate \
+    --quantMode GeneCounts \
+    --outFileNamePrefix '${sampleID}' \
+    --sjdbGTFtagExonParentTranscript Parent
+
+
+hisat2 \
+    -q \
+    --time \
+    --summary-file '${sampleID}'.sf.txt \
+    --met-file '${sampleID}'.mf.txt \
+    --threads 8 -x '${params.reference}' \
+    -U '${sampleID}'.tt.fq.gz \
+    --dta-cufflinks | \
+    tee \
+        >(samtools flagstat - > test.flagstat) | \
+    samtools sort \
+        -O BAM | \
+    tee \
+        '${sampleID}.bam' | \
+    samtools index - \
+        '${sampleID}'.bam.bai
+
+
+gmapper \
+    --qv-offset 33 \
+    -Q \
+    --strata \
+    -o 3 \
+    -N 1 \
+    '${sampleID}'.tt.fq \
+    '${params.reference}' \
+    > '${sampleID}'.bwa.bam
+	
+## Counters
+#.....................................................
+stringtie \
+    -e \
+    -v \
+    -p 14 \
+    -e \
+    -o '${sampleID}'.gtf \
+    -G '${params.gff3}' \
+    -A '${sampleID}'.ga \
+    -l '${sampleID}' \
+    '${sampleID}'.bam
+
+
+SAMFilterByGene.pl \
+    -i '${sampleID}'.bwa.bam \
+    -m 40 \
+    -o '${sampleID}'.filtered.sam
+
+
+htseq-count \
+    --format=bam \
+    --stranded=no \
+    --type=CDS \
+    --order=pos \
+    --idattr=Name \
+    '${sampleID}'.bwa.bam \
+    '${params.gff3}' > \
+    '${sampleID}'.ht_seq.tsv
+
+```
+
+# Post-processing of stringtie/htseq-count metrics
+
+```{r, engine='bash', eval=FALSE}
+## Combinng HTSeq and SAMFilterByGene.pl count tab files
+
+CombineExpression.pl all_counts_tab > abundance.matrix.tsv
+
+## predpDE and create-gem python scripts were borrowed from https://github.com/SystemsGenetics/GEMmaker 
+## Combining stingtie files. 
+for i in *.ga; do 
+	awk -F"\t" '{if (NR!=1) {print $1, $8}}' OFS='\t' $i > ${i/.ga/.fpkm}; 
+	awk -F"\t" '{if (NR!=1) {print $1, $9}}' OFS='\t' $i > ${i/.ga/.tpm}; 
+	echo -e ${i/.ga/}"\t"./${i/.ga/.gtf} > gtf_files; 
+	prepDE.py -i gtf_files -g ${i/.ga/.raw.pre};
+done
+
+ls *.pre | xargs -I {} -exec bash -c 'grep -v gene_id "{}" | tr \, \\t > "{}".try'
+rename 's/.raw.pre.try/.raw/g' *.try
+create-gem.py --sources . --prefix reference_preifx --type raw
+create-gem.py --sources . --prefix reference_preifx --type FPKM
+create-gem.py --sources . --prefix reference_preifx --type TPM
+
+```
+
+Unfortunately, only stringtie provides normalised counts in form of FPKM and TPM in addition to RAW counts. The other two methods need postprocessing in R to obtain normalised reads.
+
+These files are suitable for differential gene expression analysis using R Bioconductor packages DESeq2, edgeR, and Limma-Voom.
+
+# Kallisto Quant (_Striga hermonthica_ reference transcriptome)
+When using the _Striga hermonthica_ transcriptome assembly as reference, there is no annotation GFF available. In this case, we use Kallisto to quantify the expression of our samples
+
+First, we create a tab separated list of samples and available sequences. Next, use the make_kallisto_jobs.sh ad the tab file to create a jobs array, Finally execute the jobs in parallel.
+
+```{r, engine='bash', eval=FALSE}
+for i in `ls ../trimmed_reads/*.af.fq.gz`; do 
+  echo -e $(basename $i| cut -f 1 -d \.)"\t"$i;
+done > tab.jobs
+
+bash make_kallisto_jobs.sh tab.jobs kallisto.jobs
+parallel < kallisto.jobs
+
+```
+
+## Compile abundance tables
+```{r, engine='bash', eval=FALSE}
+## Add directory/sample name to individual abundance tables || Execute inside the main directory containing all output folders after kallisto quant
+find . -type f -name "abundance.tsv" -exec bash -c ' DIR=$( dirname "{}" ); cp "{}" "$DIR"/"${DIR##*/}"_abundance.tsv.fa ' \;
+mv */*_abundance.tsv.fa .
+
+## Put tables together
+rename 's/_//g' *.tsv ## remove underscores from filename
+rename 's/abundance/_abundance/g' *.tsv ## return underscore before 'abundance'
+# Run python script 
+python3 join_kallisto_abundance.py \
+  -i inputDir_with_renamed_tables \
+  -o outputDir \
+  --prefix Kallisto_Striga_hermonthica
+
+```
+
+................... THE END ......................
+
+<span style="color:DarkBlue; font-size:9px;">
+  Author: <a href="https://au.linkedin.com/in/fmobegi" target="_blank">Fredrick M. Mobegi, PhD</a><br/>
+  Created: 18-08-2021 Wed 07:30h<br/>
+  Copyright &copy; 2020 Fredrick Mobegi | This notebook is for reference purposes only and may contain links to embargoed or legally privileged data.
+</span>
+

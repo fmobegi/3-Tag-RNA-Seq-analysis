@@ -1,0 +1,376 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# Create the data folder if it doesn't exist
+if (!dir.exists("data")) {
+  dir.create("data")
+}
+
+# Define the file path to the plots directory
+plots_dir <- "plots"
+
+# Create the plots folder if it doesn't exist
+if (!dir.exists(plots_dir)) {
+  dir.create(plots_dir)
+}
+
+# Define the file path to the results directory
+results_dir <- "results"
+
+# Create the results folder if it doesn't exist
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir)
+}
+```
+
+
+```{r}
+data_dir <- file.path("data")
+data_file <- file.path(data_dir, "Counts_Sorghum.csv")
+metadata_file <- file.path(data_dir, "Col_Info_SB.csv")
+
+```
+
+Now that our file paths are declared, we can use the `file.exists()` function to check that the files are where we specified above. 
+
+```{r}
+# Check if the gene expression matrix file is at the path stored in `data_file`
+file.exists(data_file)
+
+# Check if the metadata file is at the file path stored in `metadata_file`
+file.exists(metadata_file)
+```
+***
+
+<!-- Do not delete this line --> <a name="analysis" style="padding-top:56px;margin-top:-56px;">&nbsp;</a>
+
+# Identifying co-expression gene modules with WGCNA - RNA-seq
+
+## Install libraries
+
+```{r}
+if (!("pacman" %in% installed.packages())) {
+  install.packages("pacman", dependencies = TRUE)
+}
+pacman::p_load(BiocManager, magrittr, DESeq2, ggplot2, impute, WGCNA, ggforce, ComplexHeatmap, install = TRUE)
+
+```
+
+
+## Import and set up data
+
+```{r}
+# Read in metadata TSV file
+metadata <- readr::read_csv(metadata_file)
+metadata.sub <- metadata %>% subset(., select = c(2,4,5)) %>% dplyr::distinct(., sample, .keep_all = TRUE) 
+
+# Read in data TSV file
+df <- readr::read_csv(data_file) %>%
+  # Here we are going to store the gene IDs as row names so that we can have a numeric matrix to perform calculations on later
+  tibble::column_to_rownames("gene")
+
+names(metadata) <- c("sample_id", "variety","times","treatment", "sample")
+metadata <- metadata %>% dplyr::filter(., sample_id %in% colnames(df))
+
+```
+
+## Check sample names bewteen counts and experimental setup
+Reorder the data and perform the checks.
+If the output to any of the 2 checks below is FALSE, then recheck the data
+
+```{r}
+names <- as.character(metadata$sample_id)
+df <- subset(df, select = names) ## reorder counts columns based on the experimental setup 
+dim(df)
+dim(metadata)
+
+## check the results
+# is.null(setdiff(colnames(counts), metadata$Sample_Name))
+all(colnames(df) %in% metadata$sample_id)
+all(colnames(df) == metadata$sample_id)
+
+m <- data.matrix(df[, 1:ncol(df)])# convert readcount table to matrix
+tibble::tibble(metadata) %>% 
+  rmarkdown::paged_table(.)
+
+```
+
+
+## Raw counts are converted to CPM to log-CPM
+
+```{r}
+## Calculate CPM from raw counts to normalize for different sequencing depth for each sample
+cpm <- apply(m,2, function(x) (x/sum(x))*1000000) 
+
+## remove any genes with a CPM of less than 1 across all samples
+m1 <- m[rowSums(cpm < 1) < 91, ]  
+```
+
+# Counts to keep
+```{r}
+options(scipen = 100)
+thresh <- m1 > 1 ###to confirm the output of filtering
+# head(thresh)
+table(rowSums(thresh))## there are 7847 genes that have TRUES in all 174 samples
+keep <- rowSums(thresh) >= 30 ## keep genes that have at least 30 TRUES in each row of thresh
+counts.keep <- m1[keep,] ## subset the rows of count-data to keep the more highly expressed genes
+summary(keep)
+dim(counts.keep)
+plot(m1[,5],m1[,5])
+
+```
+
+# DESeq DGE analysis
+
+Using the <a href="http://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html" target="_blank">DESeq protocol</a> We analysed the data through using DESeq to see if we can replicate the DEG's identified using limma-voom
+
+## Create DESeq object
+
+```{r}
+metadata$sample <- factor(metadata$sample)
+metadata$times <- factor(metadata$times)
+metadata$sample_id <- factor(metadata$sample_id)
+metadata$variety <- factor(metadata$variety)
+
+dds.raw <- DESeqDataSetFromMatrix(countData = counts.keep, colData = metadata, design = ~0+variety)
+
+## Collapse Batches for each sample
+dds <- collapseReplicates(dds.raw, dds.raw$sample, dds.raw$sample_id)
+```
+
+## Format normalized data for WGCNA
+
+Extract the normalized counts to a matrix and transpose it so we can pass it to WGCNA.
+
+```{r}
+# Normalize and transform the data in the `DESeqDataSet` object using the `vst()`
+# function from the `DESEq2` R package
+#transform dds
+dds_norm <- vst(dds)
+normalized_counts <- assay(dds_norm) %>%
+  t() # Transpose this data
+
+```
+## Determine parameters for WGCNA
+
+To identify which genes are in the same modules, WGCNA first creates a weighted network to define which genes are near each other. 
+The measure of "adjacency" it uses is based on the correlation matrix, but requires the definition of a threshold value, which in turn depends on a "power" parameter that defines the exponent used when transforming the correlation values. 
+The choice of power parameter will affect the number of modules identified, and the WGCNA modules provides the  `pickSoftThreshold()` function to help identify good choices for this parameter. 
+
+```{r}
+sft <- pickSoftThreshold(normalized_counts,
+                         dataIsExpr = TRUE,
+                         corFnc = cor,
+                         networkType = "signed"
+)
+sampleTree = hclust(dist(normalized_counts), method = "average")
+pdf(file = "Outlier_tree.pdf", width = 12, height = 9);
+par(cex = 1.6);
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="",
+     cex.lab = 1.5,cex.axis = 1.5, cex.main = 2)
+dev.off()
+```
+
+This `sft` object has a lot of information, we will want to plot some of it to figure out what our `power` soft-threshold should be. 
+We have to first calculate a measure of the model fit, the signed $R^2$, and make that a new variable. 
+
+```{r}
+# Choose a set of soft threshold parameters
+powers = c(c(1:20), seq(from = 22, to=30, by=2))
+sft = pickSoftThreshold(normalized_counts, powerVector = powers, verbose = 5) 
+# Scale-free topology fit index as a function of the soft-thresholding power
+pdf(file = "soft_threshold.pdf", width = 9, height = 5);
+par(mfrow = c(1,2));
+cex1 = 0.9;
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red");
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.90,col="red") 
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity")) 
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+dev.off()
+```
+
+## Turn data expression into topological overlap matrix
+```{r}
+power=sft$powerEstimate
+TOM = TOMsimilarityFromExpr(normalized_counts, power = 10)
+dissTOM = 1-TOM 
+# Plot gene tree
+geneTree = hclust(as.dist(dissTOM), method = "average");
+pdf(file = "3-gene_cluster.pdf", width = 12, height = 9);
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity",
+     labels = FALSE, hang = 0.04);
+dev.off()
+```
+
+## Module identification with dynamic cut tree
+
+```{r}
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,deepSplit = 2, 
+                            pamRespectsDendro = FALSE,minClusterSize = 30);
+table(dynamicMods)
+length(table(dynamicMods)) 
+# Convert numeric labels into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+# Plot the dendrogram and colors underneath
+pdf(file = "4-module_tree.pdf", width = 8, height = 6);
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",dendroLabels = FALSE,
+                    hang = 0.03,addGuide = TRUE, guideHang = 0.05,main = "Gene dendrogram and module colors")
+dev.off()
+```
+
+#obtain col data for dds and write the file
+
+```{r}
+rowData(dds.raw)
+write.csv(as.data.frame(rowData(dds.raw)),file = "dds_norm.csv") #combine the module color data with col data to annotate the modules
+
+#write module colors
+write.csv(as.data.frame(dynamicColors),file = "dynamicColors.csv")
+
+#combine the two files to create a module key file
+
+```
+
+#Annotate modules with sobi.ids
+```{r}
+
+Annotations <- read.csv("Sobic_Annotations_Meta_v32.csv")
+List <- read.csv("List_Modules_Power10.csv") #list is created from the dds col1
+Annotations_Selected = Annotations [which(Annotations$gene %in% List$gene), ]
+write.csv(as.data.frame(Annotations_Selected),file = "MES_annotations_power_10.csv")
+
+#complete the annotation by adding the module colors to the annotations. Use this to determine enrichment using ShinyGO
+
+```
+
+
+## Merge modules. 
+
+```{r}
+MEDissThres=0.65
+abline(h=MEDissThres, col = "red")
+merge = mergeCloseModules(normalized_counts, dynamicColors, cutHeight = MEDissThres, verbose = 3) 
+mergedColors = merge$colors  
+mergedMEs = merge$newMEs  
+# Plot merged module tree
+pdf(file = "5-merged_Module_Tree.pdf", width = 12, height = 9)  
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors), 
+                    c("Dynamic Tree Cut", "Merged dynamic"), dendroLabels = FALSE, 
+                    hang = 0.03, addGuide = TRUE, guideHang = 0.05)  
+dev.off()
+write.table(merge$oldMEs,file="oldMEs.txt");
+write.table(merge$newMEs,file="newMEs.txt")
+
+write.csv(as.data.frame(mergedMEs),file = "mergedMEs.csv") #write the module table (merged)
+
+write.csv(as.data.frame(merge$oldMEs),file = "Module_Eingens.csv") #write the module table (unmerged)
+
+write.csv(as.data.frame(merge$newMEs),file = "Module_Eingens_merged.csv") #write the module table (merged)
+
+```
+
+#Get hubgenes
+```{R}
+
+colorh = labels2colors(rownames(normalized_counts))
+hubs    = chooseTopHubInEachModule(normalized_counts, colorh)
+head(hubs)
+
+write.csv(as.data.frame(hubs),file = "HUB_TOP_genes_POWER_10.csv")
+```
+
+#annotate hubgenes
+
+```{r}
+Hubs <- read.csv("Sobic_Annotations_Meta_v32.csv")
+List <- read.csv("List_hub_genes.csv")
+Hubs_Selected = Hubs [which(Hubs$gene %in% List$gene), ]
+write.csv(as.data.frame(Hubs_Selected),file = "Annotated_Hubs.csv")
+
+```
+
+## Generate statistics
+
+```{r}
+# Create the design matrix from the `variety` variable
+x.meta <- data.frame(dds$sample, dds$variety) %>%
+  set_names(c("sample", "variety")) %>%
+  tibble::column_to_rownames(., var = "sample") %>% 
+  as.data.frame()
+
+x.meta$variety <- as.factor(x.meta$variety)
+des_mat <- model.matrix(data = x.meta, ~variety)# design = ~0+variety
+
+```
+
+Run linear model on each module.
+Limma wants our tests to be per row, so we also need to transpose so the eigengenes are rows
+
+```{r}
+# lmFit() needs a transposed version of the matrix
+fit <- limma::lmFit(t(merge$oldMEs), design = des_mat)
+
+# Apply empirical Bayes to smooth standard errors
+fit <- limma::eBayes(fit)
+```
+
+Apply multiple testing correction and obtain stats in a data frame. 
+
+```{r}
+# Apply multiple testing correction and obtain stats
+stats_df <- limma::topTable(fit, number = ncol(merge$oldMEs)) %>%
+  tibble::rownames_to_column("module")
+
+#write the stats file
+write.csv(as.data.frame(stats_df),file = "stats_df.csv")
+
+```
+
+## Draw a heatmap of pathway enriched for host-pathogen interaction
+```{r}
+
+#Heatmap
+library(dendsort)
+library(gplots)
+library(pheatmap)
+##select modules that have plant_pathogen interactions
+data_heatmap <- read.csv("Module_Eingens_heatmap.csv", comment.char="#")
+rnames <- data_heatmap[,1]   # assign labels in column 1 to "rnames"
+mat_data <- data.matrix(data_heatmap[,2:ncol(data_heatmap)])  # transform column 2-5 into a matrix
+rownames(mat_data) <- rnames
+
+#Cluster rows and columns not needed in RSI
+mat_cluster_cols <- hclust(dist(t(mat_data)))
+sort_hclust <- function(...) as.hclust(dendsort(as.dendrogram(...)))
+mat_cluster_rows <- sort_hclust(hclust(dist(mat_data)))
+mat_cluster_cols <- sort_hclust(mat_cluster_cols)
+
+#create annotations for rows and columns and read them as tables
+y <- read.table("Annotations_Col.txt", header=TRUE)
+
+z <- read.table("Annotation_Rows.txt", header=TRUE)
+
+##plot heatmap
+#pdf(file="heatmap_3.pdf")
+pheatmap(mat_data, cellwidth = 12, show_rownames= T,show_colnames = T, cluster_rows = F, cluster_cols = mat_cluster_cols, annotation_col = y2,  annotation_row = z, fontsize_row = 8, angle_col = c (90), fontsize_col = 8, col = bluered(120))
+#dev.off()
+
+```
+
+##End
+
+#Runo_May_2022
