@@ -1,0 +1,482 @@
+---
+title: "Self Organizing Maps (SOM): Analysis using _Striga hermonthica_ transcriptome alignment read-counts"
+editor_options:
+  chunk_output_type: console
+output:
+  html_document: 
+    fig_caption: yes
+    number_sections: yes
+    toc: yes
+  pdf_document:
+    toc: yes
+always_allow_html: yes
+---
+<style type="text/css">
+
+body{/* Normal */
+  font-size: 18px;
+  font-family: "Corbel";
+  }
+  
+td{/* Table */
+  font-size: 14px;
+  font-family: "Corbel";
+  }
+
+h1.title{
+  font-size: 38px;
+  font-family: "Corbel";
+  color: DarkRed;
+  }
+
+h1{/* Header 1 */
+  font-size: 28px;
+  font-family: "Corbel";
+  color: DarkBlue;
+  }
+  
+h2{/* Header 2 */
+  font-size: 22px;
+  font-family: "Corbel";
+  color: DarkBlue;
+  }
+  
+h3{/* Header 3 */
+  font-size: 18px;
+  font-family: "Book Antigua";
+  color: DarkBlue;
+  }
+code.r{/* Code block */
+    font-size: 13px;
+    font-family: "Book Antigua";
+  }
+pre{/* Code block - determines code spacing between lines */
+    font-size: 13px;
+    font-family: "Book Antigua";
+  }
+  
+pre code.bash {
+  background: #B53389;
+  font-size: 13px;
+  font-family: "Book Antigua";
+  }
+  
+</style>
+
+```{r setup, include=FALSE}
+rm(list=ls())
+dev.off(dev.list()["RStudioGD"])
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Libraries
+```{r message=FALSE, warning=FALSE}
+pacman::p_load(ggplot2, reshape, tidyverse, kohonen, openxlsx, RColorBrewer, readxl, plyr)
+
+```
+
+# Part 1: Formatting data for SOM
+## Read in files and format data from raw files
+```{r}
+#subset DEGs from the counts.striga matrix
+DEGs_Raw <- read.csv("Counts.Striga_Irafasha_et_al.csv")
+List <- read.csv("List_DEGs.csv")
+DGE_Raw_Selected = DEGs_Raw [which(DEGs_Raw$gene %in% List$gene), ]
+write.csv(as.data.frame(DGE_Raw_Selected),file = "DEGs_Raw.csv")
+#save it as .xlsx and read it in the next step
+
+#Read in count data
+raw.counts <- read_xlsx("DEGs_Raw.xlsx")
+countData.df <- raw.counts %>% column_to_rownames(var = "gene")
+cpm <- apply(countData.df,2, function(x) (x/sum(x))*1000000) 
+m <- countData.df[rowSums(cpm < 1) < 100, ]
+countData <- rownames_to_column(m, var = "gene")
+#Melt count data
+countData <- melt(countData)
+colnames(countData) <- c("gene", "sample", "count")
+
+#set metadata
+metadata <- read_xlsx("Col_Info.xlsx")
+colnames(metadata) <- c("sample", "variety", "times", "treatment", "sampleName")
+countData <- left_join(countData, metadata)
+countData$times <- NULL ## delete times.. same for all samples
+
+```
+
+## Most Significantly DE genes
+```{r}
+read_excel_allsheets <- function(filename, tibble = FALSE) {
+    # I prefer straight data.frames
+    # but if you like tidyverse tibbles (the default with read_excel)
+    # then just pass tibble = TRUE
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(X) readxl::read_excel(filename, sheet = X))
+    if(!tibble) x <- lapply(x, as.data.frame)
+    names(x) <- sheets
+    x
+} ## Function to import DGE results into list of lists
+
+mysheets <- read_excel_allsheets("DESeq_DGE_results_Irafasha_et_al.xlsx") #this is the file will all gene expression data
+
+#Filter significance logFC>2; p.adj <0.05
+
+mysheets.deseq.signif <- lapply(mysheets, function(x){x %>% filter(abs(log2FoldChange) >= 2 & padj <=0.05)})
+ ## Join all rows, create IDs column based on names on excel sheets 
+allGenes <- bind_rows(mysheets.deseq.signif, .id = "treatment") 
+dim(allGenes)
+
+#receive just the list
+allGenesITAG <- allGenes$gene
+
+length(allGenesITAG)
+#Remove duplicates
+allGenesITAG <- unique(allGenesITAG)
+
+```
+
+## Mean count across samples
+
+```{r}
+#make an empty table to hold all the genes
+allGeneList <- data.frame(t(rep(NA,7)))
+colnames(allGeneList) <- c("sampleName", "variety", "N", "mean", "sd", "se", "gene")
+allGeneList <- allGeneList[-1,] #remove first row
+# Takes some time to run 
+for(GENE in allGenesITAG) {
+ 
+  if(length(grep(GENE, countData$gene)) < 1){ 
+    next; 
+    }
+      
+  geneData <- subset(countData, grepl(GENE, countData$gene))
+   
+  sumGraph <- ddply(geneData, c("sampleName", "variety"), summarise,
+               N    = length(count),
+               mean = mean(count),
+               sd   = sd(count),
+               se   = sd / sqrt(N))
+  
+  sumGraph$gene <- GENE
+  
+allGeneList  <- rbind(allGeneList, sumGraph) #bind together all the new rows. 
+}
+
+dim(allGeneList)
+head(allGeneList)
+write.table(allGeneList, file = "allGeneList_S_ermonthica.csv", sep = ",")
+
+```
+
+# Part 2: Running PCA and SOM
+## Principle Component Analysis
+
+```{r}
+mostDEgenes <- allGeneList
+head(mostDEgenes)
+mostDEgenes <- mostDEgenes[c(7, 2, 4)]#keep only needed columns (gene, type, mean)
+names(mostDEgenes) <- c("gene", "sample", "mean")
+
+#Change from long to wide data format
+mostDEgene.long <- cast(mostDEgenes, gene ~ sample, mean, value = "mean")
+mostDEgene.long <- as.data.frame(mostDEgene.long) #transformation. 
+names(mostDEgene.long) #check
+mostDEgene.long$`NA` <- NULL
+# set up for PCA
+scale_data <- as.matrix(t(scale(t(mostDEgene.long[c(2:17)]))))
+#this is important and is based on the number of columns
+
+#Principle Component Analysis
+pca <- prcomp(scale_data, scale=TRUE) 
+summary(pca) 
+pca.scores <- data.frame(pca$x)
+# Add back to original so everything is together.
+data.val <- cbind(mostDEgene.long, scale_data, pca.scores) 
+head(data.val)
+
+```
+### visualize SOM data
+
+```{r}
+#creating individual box plots
+## Create a matrix using scaled gene expression values, for only the columns you want to perform a SOM. Use names (data.val)
+pacman::p_load(ggplot2, reshape, tidyverse, kohonen, openxlsx, RColorBrewer, readxl, plyr)
+
+sc.sig<-as.matrix(data.val[18:33])
+
+
+## Perform a SOM. Please think and check the topology and number of nodes. Spend some time trying different combinations and visualize the results to get an appropriate SOM node number  
+ssom<-som(sc.sig,somgrid(4,2,"hexagonal"))
+summary(ssom)
+
+set.seed(2)
+
+## Look at the training of the SOM ("changes"), the types of patterns represented in each node ("codes"), the total number of assigned genes in each node ("counts"), and the average distance of each gene from the node pattern ("quality")
+plot(ssom,type="changes")
+plot(ssom,type="codes")
+plot(ssom,type="counts")
+plot(ssom,type="quality")
+plot(ssom, type="dist.neighbours")
+
+som_cluster <- cutree(hclust(dist(as.numeric(ssom$codes[[1]]))), 4)
+# plot these results:
+#plot(ssom, type="mapping", bgcol = som_cluster, main = "Clusters") 
+add.cluster.boundaries(ssom, som_cluster) 
+
+
+## Combine the PCA information with the SOM node assignments and the distance of each gene from its respective SOM node
+data.val2<-cbind(data.val,ssom$unit.classif,ssom$distances)
+
+## Write out the SOM data
+write.csv(data.val2, file="supersom.data.transcripts.all.4x2_8_10.csv")
+codes <- ssom$codes
+write.table(codes, file="codes.transcripts.all.4x2_8_10.txt")
+
+## Visualization
+data <- read.csv("supersom.data.transcripts.all.4x2_8_10.csv",header=TRUE)
+#attach(data): put a tag to remove the masking error
+names(data)
+tail(data)
+
+## PCA+SOM graphs
+pdf("Nodes_PCAi_PCA_4x2_Striga_8_10.pdf", width=8, height=6)
+t <- ggplot(data, aes(PC1, PC2))
+t + geom_point(alpha=0.5, size=2.5,aes(colour=factor(ssom.unit.classif))) + theme_bw() + 
+  scale_colour_manual(values=c('#A6761D', '#E7298A','#1B9E77', '#D95F02', '#7570B3','#66A61E', '#E6AB02', "#666666"))
+dev.off()
+
+
+#Loess regression lines for all nodes
+expression <- data[c(2,19:34,51)] #subset scale data
+m.expression <- melt(expression, id=c("gene", "ssom.unit.classif")) #melt the data
+
+#write expression object to a .csv, 
+write.csv(expression, file="expression_4x2.csv")
+expression_4x2 <- read.csv("expression_4x2_edited.csv") #rearrange and read the file again---- excuse my poor data arragnement skills
+m2.expression <- melt(expression_4x2, id=c("gene", "ssom.unit.classif")) #melt the data
+
+#visualize individual plots
+#som1
+node1<-subset(m2.expression,ssom$unit.classif==1)
+pp1<-ggplot(node1,aes(x=variable,y=value))
+pp1+geom_point(colour="black",position="jitter",alpha=0.1)+
+  geom_boxplot(outlier.size=0,size=2,alpha=0.6)+theme_bw()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+#som2
+node2<-subset(m2.expression,ssom$unit.classif==2)
+pp2<-ggplot(node2,aes(x=variable,y=value))
+pp2+geom_point(colour="black",position="jitter",alpha=0.1)+
+  geom_boxplot(outlier.size=0,size=2,alpha=0.6)+theme_bw()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+#som3
+node3<-subset(m2.expression,ssom$unit.classif==3)
+pp3<-ggplot(node3,aes(x=variable,y=value))
+pp3+geom_point(colour="black",position="jitter",alpha=0.1)+
+  geom_boxplot(outlier.size=0,size=2,alpha=0.6)+theme_bw()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+#som4: very good for SRN39 delayed germination
+node4<-subset(m2.expression,ssom$unit.classif==4)
+pp4<-ggplot(node4,aes(x=variable,y=value))
+pp4+geom_point(colour="black",position="jitter",alpha=0.1)+
+  geom_boxplot(outlier.size=0,size=2,alpha=0.6)+theme_bw()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+#som5: everyone ha germinated
+node5<-subset(m2.expression,ssom$unit.classif==5)
+pp5<-ggplot(node5,aes(x=variable,y=value))
+pp5+geom_point(colour="black",position="jitter",alpha=0.1)+
+  geom_boxplot(outlier.size=0,size=2,alpha=0.6)+theme_bw()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+#som6: 41724 specific germination
+node6<-subset(m2.expression,ssom$unit.classif==6)
+pp6<-ggplot(node6,aes(x=variable,y=value))
+pp6+geom_point(colour="black",position="jitter",alpha=0.1)+
+  geom_boxplot(outlier.size=0,size=2,alpha=0.6)+theme_bw()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+#som7: 41724 and SRN39 specific germination
+node7<-subset(m2.expression,ssom$unit.classif==7)
+pp7<-ggplot(node7,aes(x=variable,y=value))
+pp7+geom_point(colour="black",position="jitter",alpha=0.1)+
+  geom_boxplot(outlier.size=0,size=2,alpha=0.6)+theme_bw()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+#som8:41724 and SRN39 specific germination---- GR24 contains all SLs
+node8<-subset(m2.expression,ssom$unit.classif==8)
+pp8<-ggplot(node8,aes(x=variable,y=value))
+pp8+geom_point(colour= "black",position="jitter",alpha=0.1)+
+  geom_boxplot(outlier.size=0,size=2,alpha=0.6)+theme_bw()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+
+#colored plots
+#Node4
+write.csv(node4, file="node4.csv") #edit the file and add a column for genotype
+Biomass <- read.delim("~/Documents/DE_Seq_Striga_4_10_22/node4_annotated.txt")
+Biomass$Genotype <- as.factor(Treatment$Expression)
+ggplot(Biomass, aes(x=Treatment, y=Expression, fill=Genotype)) + ggtitle("SOM4") + 
+  geom_boxplot(width=3.5) + theme_bw() + 
+  scale_y_continuous(name = "Scaled Expression") +
+  facet_grid(~HAI, scales = 'free_x', space = "free_x") +#to facet, put free_x
+  force_panelsizes(cols = c(1, .7, .7)) +
+  theme(legend.position="right") +
+  scale_x_discrete(breaks = c(06,6,6)) +
+  theme(panel.grid.major = element_line(colour = "#d3d3d3"), 
+        axis.text.x = element_text(colour="black", size = 11),
+        axis.text.y = element_text(colour="black", size = 9)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+SOM4 <- ggplot(Biomass, aes(x=Treatment, y=Expression, fill=Genotype)) + ggtitle("SOM4") + 
+  geom_boxplot(width=3.5) + theme_bw() + 
+  scale_y_continuous(name = "Scaled Expression") +
+  facet_grid(~HAI, scales = 'free_x', space = "free_x") +#to facet, put free_x
+  force_panelsizes(cols = c(1, .7, .7)) +
+  theme(legend.position="none") +
+  scale_x_discrete(breaks = c(06,6,6)) +
+  theme(panel.grid.major = element_line(colour = "#d3d3d3"), 
+        axis.text.x = element_text(colour="black", size = 11),
+        axis.text.y = element_text(colour="black", size = 9)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+pdf("Cluster4_annotated.pdf", width = 12, height = 4)
+SOM4
+dev.off()
+
+
+write.csv(node5, file="node5.csv") #edit the file and add a column for genotype
+Biomass <- read.delim("~/Documents/DE_Seq_Striga_4_10_22/node5_annotated.txt")
+Biomass$Genotype <- as.factor(Treatment$Expression)
+ggplot(Biomass, aes(x=Treatment, y=Expression, fill=Genotype)) + ggtitle("SOM5") + 
+  geom_boxplot(width=3.5) + theme_bw() + 
+  scale_y_continuous(name = "Scaled Expression") +
+  facet_grid(~HAI, scales = 'free_x', space = "free_x") +#to facet, put free_x
+  force_panelsizes(cols = c(1, .7, .7)) +
+  theme(legend.position="none") +
+  scale_x_discrete(breaks = c(06,6,6)) +
+  theme(panel.grid.major = element_line(colour = "#d3d3d3"), 
+        axis.text.x = element_text(colour="black", size = 11),
+        axis.text.y = element_text(colour="black", size = 9)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+SOM5 <- ggplot(Biomass, aes(x=Treatment, y=Expression, fill=Genotype)) + ggtitle("SOM5") + 
+  geom_boxplot(width=3.5) + theme_bw() + 
+  scale_y_continuous(name = "Scaled Expression") +
+  facet_grid(~HAI, scales = 'free_x', space = "free_x") +#to facet, put free_x
+  force_panelsizes(cols = c(1, .7, .7)) +
+  theme(legend.position="none") +
+  scale_x_discrete(breaks = c(06,6,6)) +
+  theme(panel.grid.major = element_line(colour = "#d3d3d3"), 
+        axis.text.x = element_text(colour="black", size = 11),
+        axis.text.y = element_text(colour="black", size = 9)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+pdf("Cluster5_annotated.pdf", width = 12, height = 4)
+SOM5
+dev.off()
+
+
+#Node7
+write.csv(node7, file="node7.csv") #edit the file and add a column for genotype
+Biomass <- read.delim("~/Documents/DE_Seq_Striga_4_10_22/node7_annotated.txt")
+Biomass$Genotype <- as.factor(Treatment$Expression)
+ggplot(Biomass, aes(x=Treatment, y=Expression, fill=Genotype)) + ggtitle("SOM7") + 
+  geom_boxplot(width=3.5) + theme_bw() + 
+  scale_y_continuous(name = "Scaled Expression") +
+  facet_grid(~HAI, scales = 'free_x', space = "free_x") +#to facet, put free_x
+  force_panelsizes(cols = c(1, .7, .7)) +
+  theme(legend.position="none") +
+  scale_x_discrete(breaks = c(06,6,6)) +
+  theme(panel.grid.major = element_line(colour = "#d3d3d3"), 
+        axis.text.x = element_text(colour="black", size = 11),
+        axis.text.y = element_text(colour="black", size = 9)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+SOM7 <- ggplot(Biomass, aes(x=Treatment, y=Expression, fill=Genotype)) + ggtitle("SOM7") + 
+  geom_boxplot(width=3.5) + theme_bw() + 
+  scale_y_continuous(name = "Scaled Expression") +
+  facet_grid(~HAI, scales = 'free_x', space = "free_x") +#to facet, put free_x
+  force_panelsizes(cols = c(1, .7, .7)) +
+  theme(legend.position="none") +
+  scale_x_discrete(breaks = c(06,6,6)) +
+  theme(panel.grid.major = element_line(colour = "#d3d3d3"), 
+        axis.text.x = element_text(colour="black", size = 11),
+        axis.text.y = element_text(colour="black", size = 9)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+pdf("Cluster7_annotated.pdf", width = 12, height = 4)
+SOM7
+dev.off()
+
+
+#Node8
+write.csv(node8, file="node8.csv") #edit the file and add a column for genotype
+Biomass <- read.delim("~/Documents/DE_Seq_Striga_4_10_22/node8_annotated.txt")
+Biomass$Genotype <- as.factor(Treatment$Expression)
+ggplot(Biomass, aes(x=Treatment, y=Expression, fill=Genotype)) + ggtitle("SOM8") + 
+  geom_boxplot(width=3.5) + theme_bw() + 
+  scale_y_continuous(name = "Scaled Expression") +
+  facet_grid(~HAI, scales = 'free_x', space = "free_x") +#to facet, put free_x
+  #force_panelsizes(cols = c(1, .7, .7)) +
+  theme(legend.position="none") +
+  scale_x_discrete(breaks=1:7, labels=1:7)+
+  theme(panel.grid.major = element_line(colour = "#d3d3d3"), 
+        axis.text.x = element_text(colour="black", size = 11),
+        axis.text.y = element_text(colour="black", size = 9)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+SOM8 <- ggplot(Biomass, aes(x=Treatment, y=Expression, fill=Genotype)) + ggtitle("SOM8") + 
+  geom_boxplot(width=3.5) + theme_bw() + 
+  scale_y_continuous(name = "Scaled Expression") +
+  facet_grid(~HAI, scales = 'free_x') +#to facet, put free_x
+  force_panelsizes(cols = c(1, .7, .7)) +
+  theme(legend.position="none") +
+  scale_x_discrete(breaks = c(06,6,6)) +
+  theme(panel.grid.major = element_line(colour = "#d3d3d3"), 
+        axis.text.x = element_text(colour="black", size = 11),
+        axis.text.y = element_text(colour="black", size = 9)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+pdf("Cluster8_annotated.pdf", width = 12, height = 4)
+SOM8
+dev.off()
+
+
+
+```
+
+![](SOM_by_unitClass.svg)
+
+
+![](SOM_by_somClass.svg)
+
+This script was last updated on:
+  
+```{r echo=FALSE}
+cat(as.character(format(Sys.time(), "%a %d %b %Y, %H:%M:%S")))
+
+
+```
+
+
+
+![](SOM_by_unitClass.svg)
+
+
+![](SOM_by_somClass.svg)
+
+This script was last updated on:
+  
+```{r echo=FALSE}
+cat(as.character(format(Sys.time(), "%a %d %b %Y, %H:%M:%S")))
+
+```
+
+................... THE END ......................
+
+<span style="color:DarkBlue; font-size:9px;">
+  Author: <a href="https://au.linkedin.com/in/fmobegi" target="_blank">Fredrick M. Mobegi and Steven Runo, PhD</a><br/>
+  Created: 09-09-2021 Thu 14:25h<br/>
+  Copyright &copy; 2021 Fredrick Mobegi | This notebook is for reference purposes only and may contain links to embargoed or legally privileged data.
+</span>
+

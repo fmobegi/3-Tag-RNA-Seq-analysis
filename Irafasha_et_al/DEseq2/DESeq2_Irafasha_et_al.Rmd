@@ -1,0 +1,691 @@
+---
+title: "Analysis of genes differentially expressed in _various_hosts_ during the interaction with the root hemiparasite _Striga hermonthica_"
+subtitle: 'Analysis using _Striga_hermonthica_transcriptome'
+editor_options:
+  chunk_output_type: console
+output:
+  html_document: 
+    fig_caption: yes
+    number_sections: yes
+    toc: yes
+    css: style.css
+  pdf_document:
+    toc: yes
+always_allow_html: yes
+---
+  
+```{r setup, include=FALSE, error=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("C:/Users/283899K/Dropbox/Family Room/DESeq_Rice")
+
+```
+
+# Libraries
+
+```{r message=FALSE, warning=FALSE}
+if (!require("pacman")) install.packages("pacman")
+if (!require("BiocManager")) install.packages("BiocManager")
+pacman::p_load(ggplot2, ggpubr, tidyverse, factoextra, edgeR, limma, gplots, ggrepel, EnhancedVolcano, patchwork, pals, DESeq2, openxlsx, RColorBrewer, MASS, data.table, install = TRUE)
+
+```
+
+# The datasets
+
+## Raw transcript counts and metadata
+
+```{r}
+counts.striga <- read.csv("Counts.Striga_Irafasha_et_al.csv") 
+counts.striga <- counts.striga %>% column_to_rownames(var = "gene")
+exper_setup <- read.delim("Col_Info.csv", sep = ",", check.names = F)
+names(exper_setup) <- c("sample_id", "variety","times","treatment", "sample")
+exper_setup <- exper_setup %>% filter(., sample_id %in% colnames(counts.striga))
+
+# What are the maximum counts for each sample
+colMax <- function(data) sapply(data, max, na.rm = TRUE)
+
+# colSort <- function(data, ...) sapply(data, sort, ...)
+colMax(counts.striga)
+
+```
+
+## Check sample names bewteen counts and experimental setup
+Reorder the data and perform the checks.
+If the output to any of the 2 checks below is FALSE, then recheck the data
+
+```{r}
+names <- as.character(exper_setup$sample_id)
+counts.striga <- subset(counts.striga, select = names) ## reorder counts columns based on the experimental setup 
+dim(counts.striga)
+dim(exper_setup)
+
+## check the results
+# is.null(setdiff(colnames(counts), exper_setup$Sample_Name))
+all(colnames(counts.striga) %in% exper_setup$sample_id)
+all(colnames(counts.striga) == exper_setup$sample_id)
+
+m <- data.matrix(counts.striga[, 1:ncol(counts.striga)])# convert readcount table to matrix
+tibble(exper_setup) %>% 
+  rmarkdown::paged_table(.)
+
+```
+
+## Raw counts are converted to CPM to log-CPM
+
+```{r}
+## Calculate CPM from raw counts to normalize for different sequencing depth for each sample
+cpm <- apply(m,2, function(x) (x/sum(x))*1000000) 
+
+## remove any genes with a CPM of less than 1 across all samples
+m1 <- m[rowSums(cpm < 1) < 82, ]  
+```
+
+# Counts to keep
+```{r}
+options(scipen = 100)
+thresh <- m1 > 1 ###to confirm the output of filtering
+# head(thresh)
+table(rowSums(thresh))## there are 7847 genes that have TRUES in all 174 samples
+keep <- rowSums(thresh) >= 30 ## keep genes that have at least 30 TRUES in each row of thresh
+counts.keep <- m1[keep,] ## subset the rows of count-data to keep the more highly expressed genes
+summary(keep)
+dim(counts.keep)
+plot(m1[,5],m1[,5])
+
+```
+
+# Processing (checking counts with limma approach)
+## Create DGEList
+
+```{r}
+d0 <- DGEList(m, group = exper_setup$variety)
+d0[1:3, 1:4]
+
+```
+
+# Whats in the read-count data? CPM log counts exploration and filtering of lowly expressed genes
+
+## Before normalization and removing unexpressed genes
+
+```{r, dpi=300}
+design <- model.matrix(~variety, exper_setup)
+a <- DGEList(counts = m, group = exper_setup$treatment)
+b <- voom(a,design, normalize.method = "none", plot = TRUE)
+logCounts <- log(m, 10)
+is.na(logCounts) <- (logCounts == "-Inf")
+
+boxplot(logCounts, main = "Boxplots of logCPMs (unnormalised)", xlab = "",
+        ylab = bquote("Raw reads counts per gene (Log "[10]~")"), axes = FALSE)
+axis(2)
+axis(1,at = c(1:length(colnames(logCounts))), labels = colnames(logCounts), las = 2,cex.axis = 0.3)
+abline(h = median(logCounts),col = "blue")
+rm(a, b, logCounts)## clean up
+
+```
+
+## Normalization of the filtered raw reads-count data using Quantile
+
+```{r, dpi=300, warning=FALSE}
+#options(scipen=999)
+## Calculate normalization factors
+d1 <- calcNormFactors(d0)
+d1[1:3, 1:4]
+par(oma=c(2,2,2,2))
+barplot(d1$samples$lib.size,names = colnames(d1),las = 2)
+title("Barplot of library sizes")
+
+dge <- voom(d1,design, normalize.method = "quantile", plot = T)
+logCounts <- log(dge$E, 10)
+is.na(logCounts) <- (logCounts == "NaN")
+
+boxplot(logCounts, main = "Boxplots of logCPMs (Quantile normalization)", xlab = "", 
+        ylab = bquote("Raw reads counts per million (Log "[10]~")"),axes = FALSE)
+axis(2)
+axis(1, at = c(1:length(colnames(logCounts))),labels = colnames(logCounts),las = 2,cex.axis = 0.5)
+abline(h = median(logCounts),col = "blue")
+rm(logCounts)
+
+```
+
+# Explore the filtered and normalised data further
+
+```{r}
+# We estimate the variance for each row in the logcounts matrix
+logcounts <- log(dge$E)
+is.na(logcounts) <- (logcounts == "NaN")
+
+var_genes <- apply(logcounts, 1, var)
+head(var_genes)
+###Get the gene names for the top 500 most variable genes
+select_var <- names(sort(var_genes, decreasing = TRUE))[1:50]
+# head(select_var)
+# Subset logcounts matrix
+
+highly_variable_lcpm <- logcounts[select_var,]
+dim(highly_variable_lcpm)
+# head(highly_variable_lcpm)
+## Get some nicer colours
+mypalette <- RColorBrewer::brewer.pal(11,"RdGy")
+morecols <- colorRampPalette(mypalette)
+
+svg(filename = "High_var_genes.heatmap.svg", height = 7, width = 14)
+heatmap.2(highly_variable_lcpm,
+          col = (morecols(20)),
+          trace = "none", 
+          margins = c(10,20),
+          scale = "col",
+          key.title = "",
+          Rowv = T, 
+          Colv = T,
+          dendrogram = "column")
+dev.off()
+# rm(var_genes, highly_variable_lcpm)
+
+```
+![Top variable CPM read counts](./High_var_genes.heatmap.svg)
+
+## PCA of transformed data
+
+```{r}
+set.seed(9)
+pcs <- prcomp(dge$E)
+fviz_eig(pcs, main = "Scree Plot of PCs")
+head(get_eigenvalue(pcs))
+exper_setup$Time.2 <- paste(exper_setup$times, exper_setup$variety, exper_setup$treatment, sep = "_")
+prinComp <- cbind(exper_setup, pcs$rotation[,1:3])
+
+```
+
+Everything looks fine by this stage. Most of the varience could be explained by the first 2 principle components
+
+### Scatter Plots
+#### Biological replicate effect
+
+```{r, dpi=300}
+p.seqrep <- ggplot(prinComp, 
+                   aes(x = PC1,
+                       y = PC2, 
+                       colour =variety , 
+                       shape = treatment)) + 
+  geom_point(size = 3) +
+  xlab("PC1 (75%)") + ## Check this values from head(get_eigenvalue(pcs))
+  ylab("PC2 ( 8%)") +
+  ggtitle("PCA and variety and treatment") + 
+  scale_colour_manual(values = c("#5D8AA8", "#F0F8FF", "#E32636", "#E52B50", "#FFBF00", "#A4C639", "#8DB600", "#FBCEB1", "#7FFFD4", "#4B5320", "#3B444B", "#E9D66B", "#B2BEB5", "#87A96B", "#FF9966", "#6D351A", "#007FFF", "#89CFF0", "#A1CAF1", "#F4C2C2", "#FFD12A", "#848482", "#98777B", "#F5F5DC", "#3D2B1F", "#000000", "#318CE7", "#FAF0BE", "#0000FF", "#DE5D83", "#79443B", "#CC0000", "#B5A642", "#66FF00", "#BF94E4", "#C32148", "#FF007F", "#08E8DE", "#D19FE8", "#004225", "#CD7F32", "#964B00", "#FFC1CC", "#E7FEFF", "#F0DC82", "#800020", "#DEB887", "#CC5500", "#E97451", "#8A3324", "#BD33A4", "#702963", "#536878", "#006B3C", "#ED872D")) + 
+  theme_minimal()
+
+ggsave(p.seqrep, filename = "PCA_Rep.svg", width = 10, height = 8)
+
+```
+
+![](./PCA_Rep.svg)
+## Multidimensional scaling (MDS) plot
+
+#### Treatment time [*in vitro*, Early-infection, Mid-infection]
+
+```{r}
+treatment <- factor(exper_setup$treatment)
+
+group <- interaction(treatment)
+plotMDS(dge, col = as.numeric(group), pch = 19, main="MDS plot of transformed cpm counts")
+
+mds <- plotMDS(dge, col = as.numeric(group), cex = 1.2, pch = 16, plot = F)
+toplot <- data.frame(Dim1 = mds$x, 
+                     Dim2 = mds$y, 
+                     Variety = exper_setup$variety)
+
+p <- ggplot(toplot, aes(Dim1, Dim2, colour = Variety)) + 
+  geom_point(size = 2) +
+  xlab(bquote("Leading log" [2]~"Fold change DIM 1")) +
+  ylab(bquote("Leading log" [2]~"Fold change DIM 2")) + 
+  theme_bw() +
+  scale_colour_manual(values = c("#5D8AA8", "#F0F8FF", "#E32636", "#E52B50", "#FFBF00", "#A4C639", "#8DB600", "#FBCEB1", "#7FFFD4", "#4B5320", "#3B444B", "#E9D66B", "#B2BEB5", "#87A96B", "#FF9966", "#6D351A", "#007FFF", "#89CFF0", "#A1CAF1", "#F4C2C2", "#FFD12A", "#848482", "#98777B", "#F5F5DC", "#3D2B1F", "#000000", "#318CE7", "#FAF0BE", "#0000FF", "#DE5D83", "#79443B", "#CC0000", "#B5A642", "#66FF00", "#BF94E4", "#C32148", "#FF007F", "#08E8DE", "#D19FE8", "#004225", "#CD7F32", "#964B00", "#FFC1CC", "#E7FEFF", "#F0DC82", "#800020", "#DEB887", "#CC5500", "#E97451", "#8A3324", "#BD33A4", "#702963", "#536878", "#006B3C", "#ED872D"))
+ggsave(plot = p, filename = "MDSplot.svg", height = 8.7, width = 10)
+
+```
+
+![MDS plot](./MDSplot.svg)
+
+scale colors using the <a href="http://127.0.0.1:10094/library/pals/doc/pals_examples.html" target="_blank">PALS</a> package
+
+# Voom transformation and calculation of variance weights
+```{r}
+# mm <- model.matrix(~0 + group)
+design = model.matrix(~0+variety, data = exper_setup)
+y <- voom(d1, design = design, plot = T)
+
+```
+
+
+## Fitting linear models in limma
+
+```{r}
+fit <- lmFit(y, design)
+head(coef(fit))
+
+```
+
+Empirical Bayes smoothing of standard errors (shrinks standard errors that are much larger or smaller than those from other genes towards the average standard error) (see <a href="https://www.degruyter.com/doi/10.2202/1544-6115.1027" target="_blank">here</a>)
+
+```{r}
+fit <- eBayes(fit)
+
+```
+
+## What genes are most differentially expressed
+Get the coefficients running `head(coef(fit))`
+
+```{r}
+options(scipen = 0, digits = 7)
+top.table <- topTable(fit, coef = 1, sort.by = "p", n = Inf, resort.by = "M", adjust.method = "BH", p.value = 0.05, lfc = 2)
+top.table <- topTable(fit, coef = 1, sort.by = "p", n = Inf, resort.by = "M",adjust.method = "BH")
+tibble(top.table %>% rownames_to_column(., var = "gene")) %>% 
+  rmarkdown::paged_table(.)
+
+```
+
+## Volcano plots limma-voom
+
+```{r, dpi=300}
+gene_list <- topTable(fit, coef = 4, sort.by = "logFC", n = Inf, adjust.method = "BH")
+barplot(gene_list$logFC)
+
+gene_list$diffexpressed <- "NO"
+# if log2Foldchange >= 1.8 and pvalue <= 0.01, set as "UP" 
+gene_list$diffexpressed[gene_list$logFC >= 2 & gene_list$P.Value <= 0.01] <- "UP"
+# if log2Foldchange <= -1.8 and pvalue <= 0.01, set as "DOWN"
+gene_list$diffexpressed[gene_list$logFC <= -1 & gene_list$P.Value <= 0.01] <- "DOWN"
+
+(plt1 <- ggplot(data = gene_list, aes(x = logFC, y = -log10(P.Value), col = diffexpressed)) + 
+  geom_point() + 
+  geom_vline(xintercept = c(-2, 2), col = "black", linetype = "dotted") +
+  geom_hline(yintercept = -log10(0.01), col = "black", linetype = "dotted") +
+  scale_colour_manual(name = "Differential expression", values = c("red", "grey", "blue")) +
+  ggtitle(expression("Variety..."~"P" <= 0.01~"; LogFC" >= "|2|")) +
+  xlab(bquote("Log" [2]~ "fold change", splice = TRUE)) +
+  ylab(bquote("-Log" [10]~italic("P")~"-value", splice = TRUE)) +
+  theme(legend.position = "bottom") + 
+  theme_bw())
+
+```
+
+Check the different contrasts as needed
+
+# DESeq DGE analysis
+
+Using the <a href="http://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html" target="_blank">DESeq protocol</a> We analysed the data through using DESeq to see if we can replicate the DEG's identified using limma-voom
+
+## Create DESeq object
+
+```{r}
+exper_setup$sample <- factor(exper_setup$sample)
+exper_setup$times <- factor(exper_setup$times)
+exper_setup$sample_id <- factor(exper_setup$sample_id)
+exper_setup$variety <- factor(exper_setup$variety)
+
+dds.raw <- DESeqDataSetFromMatrix(countData = counts.keep, colData = exper_setup, design = ~0+variety)
+
+## Collapse Batches for each sample
+dds <- collapseReplicates(dds.raw, dds.raw$sample, dds.raw$sample_id)
+```
+
+## Examine the colData 
+Check column names of the collapsed data to ensure samples sequenced in different lanes have been placed correctly under same sample name
+
+The `stopifnot` should break when things go wrong
+
+```{r}
+colData(dds)
+colnames(dds)
+
+# check that the sum of the counts for "sample2" is the same
+# as the counts in the "sample2  " column in dds. This is one of the samples that was resequenced.
+
+matchFirstLevel <- dds.raw$sample == levels(dds.raw$sample)[2]
+stopifnot(all(rowSums(counts(dds.raw[,matchFirstLevel])) == counts(dds[,2])))
+
+```
+
+## Run analysis
+
+```{r}
+dds <- DESeq(dds)
+# dds <- DESeq(dds.raw)
+
+resultsNames(dds)
+## Check the size factors
+sizeFactors(dds)
+## Total number of raw counts per sample
+colSums(counts(dds))
+## Total number of normalized counts per sample
+colSums(counts(dds, normalized = T))
+## Estimate gene-wise dispersion
+plotDispEsts(dds)
+
+```
+
+## See results
+
+```{r}
+res = results(dds)
+res
+plotMA(res)
+
+d <- plotCounts(dds, gene = which.min(res$padj), intgroup = "variety", returnData = TRUE)
+ggplot(d, aes(x = variety, y = count, colour = variety)) + 
+  geom_point(position = position_jitter(w = 0.1, h = 0)) + 
+  scale_y_log10() +
+  ylab(bquote("Log" [10]~"(Count)", splice = TRUE))
+
+```
+
+## Contrasts
+
+```{r}
+resultsNames(dds) ## see available contrasts
+
+## 1
+res.e1 <- results(dds, contrast = c('variety', 'GR24_06HRS', 'Ungerminated_CTRL'))
+res.e1 <- as.data.frame(res.e1) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+p1b <- EnhancedVolcano(res.e1,
+    lab = res.e1$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "GR24_6HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+
+res.e2 <- results(dds, contrast = c('variety', 'GR24_12HRS', 'Ungerminated_CTRL'))
+res.e2 <- as.data.frame(res.e2) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+p2b <- EnhancedVolcano(res.e2,
+    lab = res.e2$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "GR24_12HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+
+## 1
+res.e3 <- results(dds, contrast = c('variety', 'GR24_18HRS', 'Ungerminated_CTRL'))
+res.e3 <- as.data.frame(res.e3) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+p1 <- EnhancedVolcano(res.e3,
+    lab = res.e3$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "GR24_18HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+## 2
+res.e9 <- results(dds, contrast = c('variety', 'IS2730_06HRS', 'Ungerminated_CTRL'))
+res.e9 <- as.data.frame(res.e9) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+      # left_join(dplyr::distinct(annotation.df, gene, .keep_all = T))
+
+p9 <- EnhancedVolcano(res.e9,
+    lab = res.e9$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IS2730_6HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+## 1
+res.13 <- results(dds, contrast = c('variety', 'IS2730_12HRS', 'Ungerminated_CTRL'))
+res.13 <- as.data.frame(res.13) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+      # left_join(dplyr::distinct(annotation.df, gene, .keep_all = T)) 
+p2 <- EnhancedVolcano(res.13,
+    lab = res.13$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IS2730_12HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+## 2
+res.l9 <- results(dds, contrast = c("variety","IS2730_18HRS","Ungerminated_CTRL"))
+res.l9 <- as.data.frame(res.l9) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+      # left_join(dplyr::distinct(annotation.df, gene, .keep_all = T)) 
+p3 <- EnhancedVolcano(res.l9,
+    lab = res.l9$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IS2730_18HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+## 1
+res.23 <- results(dds, contrast = c('variety', 'IS27146_06HRS', 'Ungerminated_CTRL'))
+res.23 <- as.data.frame(res.23) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+p4 <- EnhancedVolcano(res.23,
+    lab = res.23$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IS27146_6HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+## 2
+res.29 <- results(dds, contrast = c('variety', 'IS27146_12HRS', 'Ungerminated_CTRL'))
+res.29 <- as.data.frame(res.29) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+      # left_join(dplyr::distinct(annotation.df, gene, .keep_all = T))
+
+p5 <- EnhancedVolcano(res.29,
+    lab = res.29$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IS27146_12HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+
+res.29b <- results(dds, contrast = c('variety', 'IS27146_18HRS', 'Ungerminated_CTRL'))
+res.29b <- as.data.frame(res.29b) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+      # left_join(dplyr::distinct(annotation.df, gene, .keep_all = T))
+
+p5b <- EnhancedVolcano(res.29b,
+    lab = res.29b$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IS27146_18HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+
+## 1
+res.33 <- results(dds, contrast = c('variety', 'SRN39_06HRS', 'Ungerminated_CTRL'))
+res.33 <- as.data.frame(res.33) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+p6 <- EnhancedVolcano(res.33,
+    lab = res.33$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "SRN39_6HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+
+res.33b <- results(dds, contrast = c('variety', 'SRN39_12HRS', 'Ungerminated_CTRL'))
+res.33b <- as.data.frame(res.33b) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+p6b <- EnhancedVolcano(res.33b,
+    lab = res.33b$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "SRN39_12HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+
+res.33c <- results(dds, contrast = c('variety', 'SRN39_18HRS', 'Ungerminated_CTRL'))
+res.33c <- as.data.frame(res.33c) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+p6c <- EnhancedVolcano(res.33c,
+    lab = res.33c$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "SRN39_18HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+
+## 2
+res.39b <- results(dds, contrast = c('variety', 'IS41724_06HRS', 'Ungerminated_CTRL'))
+res.39b <- as.data.frame(res.39b) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+      # left_join(dplyr::distinct(annotation.df, gene, .keep_all = T))
+
+p7b <- EnhancedVolcano(res.39b,
+    lab = res.39b$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IS41724_6HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+
+
+
+res.39 <- results(dds, contrast = c('variety', 'IS41724_12HRS', 'Ungerminated_CTRL'))
+res.39 <- as.data.frame(res.39) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+      # left_join(dplyr::distinct(annotation.df, gene, .keep_all = T))
+
+p7 <- EnhancedVolcano(res.39,
+    lab = res.39$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IS41724_12HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+## 1
+res.43 <- results(dds, contrast = c('variety', 'IS41724_18HRS', 'Ungerminated_CTRL'))
+res.43 <- as.data.frame(res.43) %>%
+  rownames_to_column(var = "gene") %>% 
+    data.frame() #%>% 
+p8 <- EnhancedVolcano(res.43,
+    lab = res.43$gene,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = "IS41724_18HRS",
+    labSize = 5,
+    col = c('#616161', 'orange2', 'blue2', 'red3'),
+    pointSize = 2)
+
+
+svg("Volcano_plots_merged_Irafasha_et_al.svg", height = 50, width = 30)
+    (p1b|p2b|p1)/(p6|p6b|p6c)/(p9|p2|p3)/(p4|p5|p5b)/(p7b|p7|p8)
+    dev.off()
+    
+```
+
+![](./DESeq2_MA_plots_all_contrasts.svg)
+
+```{r}
+ix = which.min(res.e3$padj)
+barplot(assay(dds)[ix,],las=2, main=rownames(dds)[ix])
+ix = which.min(res.e9$padj)
+barplot(assay(dds)[ix,],las=2, main=rownames(dds)[ix])
+ix = which.min(res.l3$padj)
+barplot(assay(dds)[ix,],las=2, main=rownames(dds)[ix])
+ix = which.min(res.l9$padj)
+barplot(assay(dds)[ix,],las=2, main=rownames(dds)[ix])
+
+```
+
+
+## Add annotations if applicable and write to single Excel Workbook
+
+Activate `eval=TRUE` when running for the first time only. Otherwise no need overwriting the excel file over and over with each knit
+```{r, eval=FALSE}
+
+
+wb <- createWorkbook()
+addWorksheet(wb, "GR24_06HRS")
+addWorksheet(wb, "GR24_12HRS")
+addWorksheet(wb, "GR24_18HRS")
+addWorksheet(wb, "IS2730_06HRS")
+addWorksheet(wb, "IS2730_12HRS")
+addWorksheet(wb, "IS2730_18HRS")
+addWorksheet(wb, "SRN39_06HRS")
+addWorksheet(wb, "SRN39_12HRS")
+addWorksheet(wb, "SRN39_18HRS")
+addWorksheet(wb, "IS41724_06HRS")
+addWorksheet(wb, "IS41724_12HRS")
+addWorksheet(wb, "IS41724_18HRS")
+addWorksheet(wb, "IS27146_06HRS")
+addWorksheet(wb, "IS27146_12HRS")
+addWorksheet(wb, "IS27146_18HRS")
+writeData(wb, sheet = "GR24_06HRS", res.e1)
+writeData(wb, sheet = "GR24_12HRS", res.e2)
+writeData(wb, sheet = "GR24_18HRS", res.e3)
+writeData(wb, sheet = "IS2730_06HRS", res.e9)
+writeData(wb, sheet = "IS2730_12HRS", res.13)
+writeData(wb, sheet = "IS2730_18HRS", res.l9)
+writeData(wb, sheet = "SRN39_06HRS", res.33)
+writeData(wb, sheet = "SRN39_12HRS", res.33b)
+writeData(wb, sheet = "SRN39_18HRS", res.33c)
+writeData(wb, sheet = "IS41724_06HRS", res.39b)
+writeData(wb, sheet = "IS41724_12HRS", res.39)
+writeData(wb, sheet = "IS41724_18HRS", res.43)
+writeData(wb, sheet = "IS27146_06HRS", res.23)
+writeData(wb, sheet = "IS27146_12HRS", res.29)
+writeData(wb, sheet = "IS27146_18HRS", res.29b)
+
+saveWorkbook(wb, "DESeq_DGE_results_Irafasha_et_al.xlsx", overwrite = TRUE)
+
+```
+
+This script was last updated on:
+  
+```{r echo=FALSE}
+cat(as.character(format(Sys.time(), "%a %d %b %Y, %H:%M:%S")))
+
+```
+
+................... THE END ......................
+
+<span style="color:DarkBlue; font-size:9px;">
+  Author: <a href="https://au.linkedin.com/in/fmobegi" target="_blank">Fredrick M. Mobegi, PhD</a><br/>
+  Created: 17-08-2021 Tue 16:30h<br/>
+  Copyright &copy; 2020 Fredrick Mobegi and Steven Runo | This notebook is for reference purposes only and may contain links to embargoed or legally privileged data.
+</span>
+
